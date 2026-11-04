@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FRP 管理面板</title><link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/"><span class="brand-mark small">F</span><span>FRP 管理面板</span></a>
+    <div class="top-actions"><span class="live-indicator"><i></i>本机客户端</span><button class="icon-button" id="logout" title="退出登录" aria-label="退出登录">↪</button></div>
+  </header>
+  <main class="workspace">
+    <section class="page-heading">
+      <div><p class="eyebrow">CLIENT OVERVIEW</p><h1>连接实例</h1><p class="subheading">管理本机 frpc 客户端与远端节点连接</p></div>
+      <button class="primary-button add-button" id="add"><span>＋</span> 添加实例</button>
+    </section>
+    <section class="summary" aria-label="连接统计">
+      <div><span class="summary-label">实例总数</span><strong id="total">0</strong></div>
+      <div><span class="summary-label">运行中</span><strong id="running">0</strong></div>
+      <div><span class="summary-label">活动隧道</span><strong id="tunnels">0</strong></div>
+      <div><span class="summary-label">累计流量</span><strong id="traffic">0 B</strong></div>
+    </section>
+    <section class="section-heading"><h2>客户端实例</h2><span id="updated" class="muted">正在同步</span></section>
+    <div id="profiles" class="profile-list"></div>
+    <div id="empty" class="empty-state" hidden><div class="empty-icon">⌁</div><h2>尚无客户端实例</h2><p>添加配置以连接远端 frps 节点</p><button class="secondary-button" id="empty-add">添加第一个实例</button></div>
+  </main>
+
+  <dialog id="editor" class="editor-dialog">
+    <form id="profile-form" method="dialog">
+      <div class="dialog-heading"><div><p class="eyebrow">CLIENT PROFILE</p><h2 id="dialog-title">添加实例</h2></div><button type="button" class="icon-button" id="close" aria-label="关闭">×</button></div>
+      <label class="field-label">实例名称<input id="name" maxlength="80" placeholder="例如：东京边缘节点" required></label>
+      <label class="field-label">TOML 配置<textarea id="config" spellcheck="false" required placeholder='serverAddr = "frps.example.com"&#10;serverPort = 7000&#10;&#10;[[proxies]]&#10;name = "web"&#10;type = "http"&#10;localPort = 8080&#10;customDomains = ["example.com"]'></textarea></label>
+      <p id="editor-error" class="form-error"></p>
+      <div class="dialog-footer"><span class="muted">保存前将检查 TOML 格式</span><button class="primary-button" type="submit">保存配置</button></div>
+    </form>
+  </dialog>
+  <script src="/assets/app.js"></script>
+</body>
+</html>
