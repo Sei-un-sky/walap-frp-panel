@@ -17,8 +17,8 @@
     <section class="summary" aria-label="连接统计">
       <div><span class="summary-label">实例总数</span><strong id="total">0</strong></div>
       <div><span class="summary-label">运行中</span><strong id="running">0</strong></div>
-      <div><span class="summary-label">活动隧道</span><strong id="tunnels">0</strong></div>
-      <div><span class="summary-label">累计流量</span><strong id="traffic">0 B</strong></div>
+      <div><span class="summary-label">运行隧道</span><strong id="tunnels">0</strong></div>
+      <div><span class="summary-label">累计流量</span><strong id="traffic">未提供</strong></div>
     </section>
     <section class="section-heading"><h2>客户端实例</h2><span id="updated" class="muted">正在同步</span></section>
     <div id="profiles" class="profile-list"></div>
@@ -29,7 +29,8 @@
     <form id="profile-form" method="dialog">
       <div class="dialog-heading"><div><p class="eyebrow">CLIENT PROFILE</p><h2 id="dialog-title">添加实例</h2></div><button type="button" class="icon-button" id="close" aria-label="关闭">×</button></div>
       <label class="field-label">实例名称<input id="name" maxlength="80" placeholder="例如：东京边缘节点" required></label>
-      <label class="field-label">TOML 配置<textarea id="config" spellcheck="false" required placeholder='serverAddr = "frps.example.com"&#10;serverPort = 7000&#10;&#10;[[proxies]]&#10;name = "web"&#10;type = "http"&#10;localPort = 8080&#10;customDomains = ["example.com"]'></textarea></label>
+      <label class="field-label">TOML 配置<textarea id="config" spellcheck="false" required placeholder='serverAddr = "frps.example.com"&#10;serverPort = 7000&#10;&#10;[webServer]&#10;addr = "127.0.0.1"&#10;port = 7400&#10;user = "frpc-admin"&#10;password = "替换为独立强密码"&#10;&#10;[[proxies]]&#10;name = "web"&#10;type = "http"&#10;localPort = 8080&#10;customDomains = ["example.com"]'></textarea></label>
+      <p class="muted config-hint">隧道状态需要 [webServer] 管理接口，保存后重启该 frpc 实例生效。代理流量统计需要另行配置 frps Dashboard。</p>
       <p id="editor-error" class="form-error"></p>
       <div class="dialog-footer"><span class="muted">保存前将检查 TOML 格式</span><button class="primary-button" type="submit">保存配置</button></div>
     </form>
@@ -50,6 +51,6 @@
       </section>
     </div>
   </dialog>
-  <script src="/assets/app.js"></script>
+  <script src="/assets/theme.js"></script><script src="/assets/app.js"></script>
 </body>
 </html>

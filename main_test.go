@@ -28,6 +28,26 @@ func TestParseMetrics(t *testing.T) {
 	}
 }
 
+func TestReadFRPCStatusGroupedByType(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/status" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"tcp":[{"name":"ssh","type":"tcp","status":"running","err":""}],"http":[{"name":"site","type":"http","status":"start error","err":"local port unavailable"}]}`))
+	}))
+	defer server.Close()
+
+	tunnels, connected, message := readFRPCStatus(server.Client(), server.URL, &adminConfig{})
+	if !connected || message != "" {
+		t.Fatalf("status connected=%v message=%q", connected, message)
+	}
+	if len(tunnels) != 2 || tunnels[0].Name != "site" || tunnels[0].Status != "start error" || tunnels[1].Name != "ssh" || tunnels[1].Status != "running" {
+		t.Fatalf("unexpected tunnels: %#v", tunnels)
+	}
+}
+
 func TestLoginAndProtectedAPI(t *testing.T) {
 	dir := t.TempDir()
 	users := newUserStore(dir)

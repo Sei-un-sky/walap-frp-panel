@@ -8,7 +8,7 @@
 - CLI 初始化管理员、创建用户、重置密码和删除用户；生成的一次性临时密码只输出在命令行，并要求首次登录后修改。
 - 密码以 PBKDF2-HMAC-SHA256 派生值和随机盐保存，不存明文。
 - 网页编辑 TOML、语法检查、实例启停；修改已有配置前自动备份旧版本。
-- 夜间模式开关，选择保存在当前浏览器本地。
+- 默认跟随设备明暗主题实时切换；工具栏主题按钮可在跟随系统、夜间、明亮三种模式间切换，手动选择保存在当前浏览器本地。
 - 显示 `frpc` 进程状态、管理接口状态、隧道状态及接口提供的流量累计值。
 
 ## 环境要求与构建
@@ -31,10 +31,10 @@ go build -o frp-manager .
 FRP_MANAGER_DATA_DIR=/var/lib/frp-manager ./frp-manager admin-init admin
 ```
 
-保存输出的用户名和临时密码。首次登录会要求设置新密码。Linux systemd 服务使用 `seiun` 用户时，应确保该目录可由服务账户读写，例如：
+保存输出的用户名和临时密码。首次登录会要求设置新密码。账号库位于 `FRP_MANAGER_DATA_DIR/users.json`；数据目录必须由 systemd 选择的运行用户读写。例如模板使用 `frp-manager` 用户时：
 
 ```sh
-install -d -o seiun -g seiun -m 0700 /var/lib/frp-manager
+install -d -o frp-manager -g frp-manager -m 0700 /var/lib/frp-manager
 ```
 
 管理员也可以在网页的“账号设置”中创建普通用户或管理员。新账号的临时密码会在创建结果中显示一次，首次登录必须修改。网页管理员可以删除其他账号，但不能删除自己；最后一个管理员需通过 CLI 保留。
@@ -79,10 +79,37 @@ export FRPC_BINARY=/opt/frp-manager/frpc
 
 ## systemd 管理
 
-仓库提供了参考 unit 文件 [frp-manager.service.example](./frp-manager.service.example)。按实际安装路径调整 `User`、`Group`、`WorkingDirectory`、`ExecStart` 和 `FRPC_BINARY` 后安装：
+仓库提供了 [systemd unit 模板](./frp-manager.service) 和 [环境配置模板](./frp-manager.conf)。模板默认使用专用的 `frp-manager` 系统账户；客户可以改为已有服务账户或其他受限账户。`User`/`Group` 是 systemd unit 字段，不在环境配置文件中设置。
+
+以下示例创建专用账户、设置数据目录权限并安装环境配置。若客户使用已有账户，把命令中的 `frp-manager` 替换为实际用户名和组名：
 
 ```sh
-sudo install -o root -g root -m 0644 frp-manager.service.example /etc/systemd/system/frp-manager.service
+sudo useradd --system --home /var/lib/frp-manager --shell /usr/sbin/nologin frp-manager
+sudo install -d -o frp-manager -g frp-manager -m 0700 /var/lib/frp-manager
+sudo install -o root -g root -m 0644 frp-manager.conf /etc/default/frp-manager
+sudoedit /etc/default/frp-manager
+```
+
+`/etc/default/frp-manager` 中设置面板监听地址、数据目录和 `frpc` 二进制路径；这里不放面板登录密码。管理员账号通过 CLI 初始化并保存在数据目录中。
+
+客户也可以编辑 unit 中的 `User` 和 `Group`，或通过 systemd drop-in 覆盖：
+
+```sh
+sudo systemctl edit frp-manager
+```
+
+写入所需账户：
+
+```ini
+[Service]
+User=customer-service-user
+Group=customer-service-group
+```
+
+确认 [unit 模板](./frp-manager.service) 中的 `WorkingDirectory` 和 `ExecStart` 与安装路径一致后安装并启用：
+
+```sh
+sudo install -o root -g root -m 0644 frp-manager.service /etc/systemd/system/frp-manager.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now frp-manager
 ```
@@ -99,9 +126,20 @@ sudo journalctl -u frp-manager -f
 
 unit 示例将面板绑定在 `127.0.0.1:8080`，适合由本机 HTTPS 反向代理转发。若直接绑定内网地址，请自行评估网络访问控制和 TLS，不建议将服务暴露到公网。
 
+### 用户 TOML 文件位置
+
+假设 `FRP_MANAGER_DATA_DIR=/var/lib/frp-manager`：
+
+- 网页保存的配置和实例元数据：`/var/lib/frp-manager/profiles.json`。每个实例的 `config` 字段保存用户提交的完整 TOML，是面板编辑和持久化的权威副本。
+- 启动实例时实际交给 `frpc -c` 的文件：`/var/lib/frp-manager/configs/<实例ID>.toml`。面板启动实例时从 `profiles.json` 写出或更新该运行文件。
+- 修改已有配置前保存的旧版本：`/var/lib/frp-manager/backups/<实例ID>.<时间戳>.toml`。
+- 面板账号数据库：`/var/lib/frp-manager/users.json`。
+
+以上路径由 `FRP_MANAGER_DATA_DIR` 决定。服务运行用户需要对数据目录有读写权限。直接修改生成的 `configs/` 文件不会改动网页保存的配置；后续启动时会再次由 `profiles.json` 写出。
+
 ## FRP 管理接口和数据限制
 
-读取隧道状态和流量指标需要在每个 `frpc` TOML 中启用管理接口：
+读取每条隧道的建立状态需要在每个 `frpc` TOML 中启用管理接口：
 
 ```toml
 serverAddr = "frps.example.com"
@@ -121,7 +159,11 @@ localPort = 8080
 remotePort = 6000
 ```
 
-管理接口凭据保存在 TOML 配置中，配置编辑器会回显完整内容。应限制面板账号权限，并为各接口使用独立凭据。面板通过 `/api/status` 读取代理信息，通过 `/metrics` 解析流量计数；不同 FRP 版本的 API/指标可能有差异。当前流量为接口提供的累计值，不保存历史采样，也不保证所有版本都能提供逐隧道流量。进程运行状态不等于已连接远端 `frps`。
+管理接口凭据保存在 TOML 配置中，配置编辑器会回显完整内容。应限制面板账号权限，并为各接口使用独立凭据。面板通过 `frpc` 的 `/api/status` 读取代理列表及 `running`、`start error` 等运行状态。需要在每份客户端 TOML 中配置 `[webServer]` 并重启对应 `frpc`，否则只能看到进程状态，不能确认服务端隧道是否建立。
+
+FRP 0.71.1 的 `frpc` `/metrics` 只提供 Go 运行时指标，不包含代理流量，因此面板不会把缺失数据伪装成 `0 B`，而会显示“未提供”。代理流量统计由 `frps` 服务端 Dashboard API 提供；如需在面板展示每条代理的实时累计流量，需要额外配置对应 `frps` dashboard 地址和账号，再按代理名称查询 `/api/traffic/{name}`。当前版本尚未接入该服务端 API。
+
+`running` 表示 frpc 当前成功启动了对应代理。若显示 `start error`，请检查相应 `err` 信息、frps 端口和本地服务监听；“进程运行中”只代表 frpc 进程还活着，不代表某条隧道可用。配置管理接口后需重启该实例使设置生效。
 
 ## 测试环境记录
 

@@ -5,12 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=seiun
-Group=seiun
+User=frp-manager
+Group=frp-manager
 WorkingDirectory=/opt/frp-manager
-Environment=FRP_MANAGER_ADDR=127.0.0.1:8080
-Environment=FRP_MANAGER_DATA_DIR=/var/lib/frp-manager
-Environment=FRPC_BINARY=/opt/frp-manager/frpc
+EnvironmentFile=/etc/default/frp-manager
 ExecStart=/opt/frp-manager/frp-manager
 Restart=on-failure
 RestartSec=3

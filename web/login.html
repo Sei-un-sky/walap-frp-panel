@@ -15,6 +15,7 @@
       <button class="primary-button" type="submit">登录</button>
     </form>
   </main>
+  <script src="/assets/theme.js"></script>
   <script>
     fetch('/api/me').then(response => { if (response.ok) return response.json(); throw new Error('not authenticated'); }).then(user => location.replace(user.mustChange ? '/account.html' : '/')).catch(() => {});
     document.querySelector('#login-form').addEventListener('submit', async event => {

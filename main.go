@@ -40,6 +40,7 @@ type Runtime struct {
 	Running      bool     `json:"running"`
 	AdminEnabled bool     `json:"adminEnabled"`
 	Connected    bool     `json:"connected"`
+	TrafficKnown bool     `json:"trafficKnown"`
 	PID          int      `json:"pid,omitempty"`
 	Error        string   `json:"error,omitempty"`
 	Tunnels      []Tunnel `json:"tunnels"`
@@ -51,6 +52,7 @@ type Tunnel struct {
 	Name   string `json:"name"`
 	Type   string `json:"type"`
 	Status string `json:"status"`
+	Error  string `json:"err,omitempty"`
 }
 
 type profileView struct {
@@ -538,47 +540,45 @@ func (m *manager) snapshot() []profileView {
 			rt.AdminEnabled = true
 			client := http.Client{Timeout: time.Second}
 			base := "http://" + net.JoinHostPort(admin.addr, strconv.Itoa(admin.port))
-			for endpoint, kind := range map[string]string{"/api/status": "status", "/metrics": "metrics"} {
-				req, _ := http.NewRequest(http.MethodGet, base+endpoint, nil)
-				if admin.user != "" || admin.password != "" {
-					req.SetBasicAuth(admin.user, admin.password)
-				}
-				resp, err := client.Do(req)
-				if err != nil {
-					rt.Error = "无法连接 frpc 管理接口"
-					continue
-				}
-				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-					rt.Error = "frpc 管理接口返回异常状态"
-					resp.Body.Close()
-					continue
-				}
-				if kind == "status" {
-					var body struct {
-						Proxies []struct {
-							Name   string `json:"name"`
-							Type   string `json:"type"`
-							Status string `json:"status"`
-						} `json:"proxies"`
-					}
-					if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body) == nil {
-						rt.Connected = true
-						for _, proxy := range body.Proxies {
-							rt.Tunnels = append(rt.Tunnels, Tunnel{proxy.Name, proxy.Type, proxy.Status})
-						}
-					} else {
-						rt.Error = "无法解析 frpc 隧道状态"
-					}
-				} else {
-					rt.InBytes, rt.OutBytes = parseMetrics(resp.Body)
-				}
-				resp.Body.Close()
-			}
+			rt.Tunnels, rt.Connected, rt.Error = readFRPCStatus(&client, base, admin)
 		}
 		result = append(result, profileView{p, rt})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].UpdatedAt.After(result[j].UpdatedAt) })
 	return result
+}
+
+func readFRPCStatus(client *http.Client, base string, admin *adminConfig) ([]Tunnel, bool, string) {
+	req, err := http.NewRequest(http.MethodGet, base+"/api/status", nil)
+	if err != nil {
+		return nil, false, "无法创建 frpc 状态请求"
+	}
+	if admin.user != "" || admin.password != "" {
+		req.SetBasicAuth(admin.user, admin.password)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, false, "无法连接 frpc 管理接口"
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, false, "frpc 管理接口返回异常状态"
+	}
+	var grouped map[string][]Tunnel
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&grouped); err != nil {
+		return nil, false, "无法解析 frpc 隧道状态"
+	}
+	tunnels := make([]Tunnel, 0)
+	for proxyType, proxies := range grouped {
+		for _, proxy := range proxies {
+			if proxy.Type == "" {
+				proxy.Type = proxyType
+			}
+			tunnels = append(tunnels, proxy)
+		}
+	}
+	sort.Slice(tunnels, func(i, j int) bool { return tunnels[i].Name < tunnels[j].Name })
+	return tunnels, true, ""
 }
 
 type adminConfig struct {
@@ -649,7 +649,7 @@ func (h *webHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		name := filepath.Base(r.URL.Path)
-		if name != "app.css" && name != "app.js" && name != "account.js" {
+		if name != "app.css" && name != "app.js" && name != "account.js" && name != "theme.js" {
 			http.NotFound(w, r)
 			return
 		}
