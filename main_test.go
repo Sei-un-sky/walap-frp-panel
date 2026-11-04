@@ -3,9 +3,9 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestValidateConfig(t *testing.T) {
@@ -29,14 +29,19 @@ func TestParseMetrics(t *testing.T) {
 }
 
 func TestLoginAndProtectedAPI(t *testing.T) {
-	h := &webHandler{manager: newManager(t.TempDir(), "frpc"), username: "admin", password: "secret", sessions: map[string]time.Time{}}
+	dir := t.TempDir()
+	users := newUserStore(dir)
+	if _, err := users.add("admin", "admin", "initial-password", false); err != nil {
+		t.Fatal(err)
+	}
+	h := &webHandler{manager: newManager(dir, "frpc"), users: users, sessions: map[string]session{}}
 	api := httptest.NewRecorder()
 	h.ServeHTTP(api, httptest.NewRequest(http.MethodGet, "/api/profiles", nil))
 	if api.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated API status = %d", api.Code)
 	}
 	login := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(`{"username":"admin","password":"secret"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(`{"username":"admin","password":"initial-password"}`))
 	req.Header.Set("Content-Type", "application/json")
 	h.ServeHTTP(login, req)
 	if login.Code != http.StatusNoContent {
@@ -61,5 +66,61 @@ func TestLoginAndProtectedAPI(t *testing.T) {
 	h.ServeHTTP(api, req)
 	if api.Code != http.StatusUnauthorized {
 		t.Fatalf("logged-out API status = %d", api.Code)
+	}
+}
+
+func TestTemporaryPasswordRequiresChange(t *testing.T) {
+	dir := t.TempDir()
+	users := newUserStore(dir)
+	if _, err := users.add("admin", "admin", "temporary-pass", true); err != nil {
+		t.Fatal(err)
+	}
+	h := &webHandler{manager: newManager(dir, "frpc"), users: users, sessions: map[string]session{}}
+	login := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(`{"username":"admin","password":"temporary-pass"}`))
+	h.ServeHTTP(login, req)
+	if login.Code != http.StatusNoContent {
+		t.Fatalf("login status = %d", login.Code)
+	}
+	cookie := login.Result().Cookies()[0]
+	blocked := httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/profiles", nil)
+	req.AddCookie(cookie)
+	h.ServeHTTP(blocked, req)
+	if blocked.Code != http.StatusForbidden {
+		t.Fatalf("temporary password API status = %d", blocked.Code)
+	}
+	changed := httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/password", strings.NewReader(`{"new":"a-new-password"}`))
+	req.AddCookie(cookie)
+	h.ServeHTTP(changed, req)
+	if changed.Code != http.StatusNoContent {
+		t.Fatalf("password change status = %d, body=%s", changed.Code, changed.Body.String())
+	}
+	if _, ok := users.authenticate("admin", "a-new-password"); !ok {
+		t.Fatal("new password does not authenticate")
+	}
+}
+
+func TestUserStoreAccountsAndLastAdmin(t *testing.T) {
+	store := newUserStore(t.TempDir())
+	if _, err := store.add("Root.Admin", "admin", "temporary-pass", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.authenticate("root.admin", "temporary-pass"); !ok {
+		t.Fatal("case-normalized username did not authenticate")
+	}
+	if _, err := store.add("ops", "user", "another-password", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.remove("Root.Admin"); err == nil {
+		t.Fatal("removed the last administrator")
+	}
+	reloaded := newUserStore(filepath.Dir(store.path))
+	if err := reloaded.load(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reloaded.get("root.admin"); !ok {
+		t.Fatal("administrator was not persisted")
 	}
 }

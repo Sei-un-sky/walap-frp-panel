@@ -16,11 +16,11 @@
     </form>
   </main>
   <script>
-    fetch('/api/profiles').then(response => { if (response.ok) location.replace('/'); });
+    fetch('/api/me').then(response => { if (response.ok) return response.json(); throw new Error('not authenticated'); }).then(user => location.replace(user.mustChange ? '/account.html' : '/')).catch(() => {});
     document.querySelector('#login-form').addEventListener('submit', async event => {
       event.preventDefault(); const form = new FormData(event.currentTarget);
       const response = await fetch('/api/login', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:form.get('username'),password:form.get('password')})});
-      if (response.ok) location.href='/'; else document.querySelector('#error').textContent='用户名或密码错误';
+      if (response.ok) { const me=await fetch('/api/me').then(result=>result.json()); location.href=me.mustChange?'/account.html':'/'; } else document.querySelector('#error').textContent='用户名或密码错误';
     });
   </script>
 </body>

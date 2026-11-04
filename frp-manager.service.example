@@ -1,0 +1,25 @@
+[Unit]
+Description=FRP Client Management Panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=seiun
+Group=seiun
+WorkingDirectory=/opt/frp-manager
+Environment=FRP_MANAGER_ADDR=127.0.0.1:8080
+Environment=FRP_MANAGER_DATA_DIR=/var/lib/frp-manager
+Environment=FRPC_BINARY=/opt/frp-manager/frpc
+ExecStart=/opt/frp-manager/frp-manager
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/frp-manager
+
+[Install]
+WantedBy=multi-user.target

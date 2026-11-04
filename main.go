@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -24,6 +26,8 @@ import (
 )
 
 const maxBody = 2 << 20
+const passwordIterations = 310000
+const minPasswordLength = 8
 
 type Profile struct {
 	ID        string    `json:"id"`
@@ -60,6 +64,264 @@ type manager struct {
 	process  map[string]*exec.Cmd
 	dataDir  string
 	frpc     string
+}
+
+type account struct {
+	Username   string    `json:"username"`
+	Role       string    `json:"role"`
+	Salt       string    `json:"salt"`
+	Hash       string    `json:"hash"`
+	MustChange bool      `json:"mustChange"`
+	CreatedAt  time.Time `json:"createdAt"`
+}
+
+type userStore struct {
+	mu    sync.Mutex
+	path  string
+	users map[string]account
+}
+
+type session struct {
+	Username string
+	Expires  time.Time
+}
+
+type publicAccount struct {
+	Username   string `json:"username"`
+	Role       string `json:"role"`
+	MustChange bool   `json:"mustChange"`
+}
+
+func newUserStore(dataDir string) *userStore {
+	return &userStore{path: filepath.Join(dataDir, "users.json"), users: map[string]account{}}
+}
+
+func (s *userStore) load() error {
+	b, err := os.ReadFile(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var users []account
+	if err := json.Unmarshal(b, &users); err != nil {
+		return err
+	}
+	for _, u := range users {
+		if validUsername(u.Username) && (u.Role == "admin" || u.Role == "user") {
+			s.users[u.Username] = u
+		}
+	}
+	return nil
+}
+
+func (s *userStore) saveLocked() error {
+	users := make([]account, 0, len(s.users))
+	for _, u := range s.users {
+		users = append(users, u)
+	}
+	sort.Slice(users, func(i, j int) bool { return users[i].Username < users[j].Username })
+	b, err := json.MarshalIndent(users, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(s.path), 0700); err != nil {
+		return err
+	}
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
+}
+
+func (s *userStore) add(username, role, password string, mustChange bool) (account, error) {
+	username = strings.TrimSpace(strings.ToLower(username))
+	if !validUsername(username) {
+		return account{}, errors.New("用户名需为 3 到 32 位字母、数字、点、下划线或连字符")
+	}
+	if role != "admin" && role != "user" {
+		return account{}, errors.New("角色必须是 admin 或 user")
+	}
+	if len(password) < minPasswordLength {
+		return account{}, fmt.Errorf("密码至少需要 %d 个字符", minPasswordLength)
+	}
+	user, err := newAccount(username, role, password, mustChange)
+	if err != nil {
+		return account{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.users[username]; ok {
+		return account{}, errors.New("用户名已存在")
+	}
+	s.users[username] = user
+	if err := s.saveLocked(); err != nil {
+		delete(s.users, username)
+		return account{}, err
+	}
+	return user, nil
+}
+
+func (s *userStore) authenticate(username, password string) (account, bool) {
+	s.mu.Lock()
+	user, ok := s.users[strings.ToLower(strings.TrimSpace(username))]
+	s.mu.Unlock()
+	if !ok {
+		return account{}, false
+	}
+	salt, err := hex.DecodeString(user.Salt)
+	if err != nil {
+		return account{}, false
+	}
+	expected, err := hex.DecodeString(user.Hash)
+	if err != nil {
+		return account{}, false
+	}
+	actual := passwordHash(password, salt)
+	return user, subtle.ConstantTimeCompare(actual, expected) == 1
+}
+
+func (s *userStore) changePassword(username, oldPassword, newPassword string, skipOld bool) error {
+	if len(newPassword) < minPasswordLength {
+		return fmt.Errorf("新密码至少需要 %d 个字符", minPasswordLength)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.users[username]
+	if !ok {
+		return errors.New("账号不存在")
+	}
+	if !skipOld {
+		salt, _ := hex.DecodeString(user.Salt)
+		expected, _ := hex.DecodeString(user.Hash)
+		if subtle.ConstantTimeCompare(passwordHash(oldPassword, salt), expected) != 1 {
+			return errors.New("当前密码错误")
+		}
+	}
+	updated, err := newAccount(user.Username, user.Role, newPassword, false)
+	if err != nil {
+		return err
+	}
+	updated.CreatedAt = user.CreatedAt
+	s.users[username] = updated
+	if err := s.saveLocked(); err != nil {
+		s.users[username] = user
+		return err
+	}
+	return nil
+}
+
+func (s *userStore) remove(username string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.users[username]
+	if !ok {
+		return os.ErrNotExist
+	}
+	if user.Role == "admin" {
+		admins := 0
+		for _, u := range s.users {
+			if u.Role == "admin" {
+				admins++
+			}
+		}
+		if admins <= 1 {
+			return errors.New("不能删除最后一个管理员")
+		}
+	}
+	delete(s.users, username)
+	if err := s.saveLocked(); err != nil {
+		s.users[username] = user
+		return err
+	}
+	return nil
+}
+
+func (s *userStore) resetPassword(username, password string) error {
+	if len(password) < minPasswordLength {
+		return fmt.Errorf("临时密码至少需要 %d 个字符", minPasswordLength)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.users[username]
+	if !ok {
+		return os.ErrNotExist
+	}
+	updated, err := newAccount(user.Username, user.Role, password, true)
+	if err != nil {
+		return err
+	}
+	updated.CreatedAt = user.CreatedAt
+	s.users[username] = updated
+	if err := s.saveLocked(); err != nil {
+		s.users[username] = user
+		return err
+	}
+	return nil
+}
+
+func (s *userStore) list() []publicAccount {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]publicAccount, 0, len(s.users))
+	for _, u := range s.users {
+		result = append(result, publicAccount{u.Username, u.Role, u.MustChange})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Username < result[j].Username })
+	return result
+}
+
+func (s *userStore) get(username string) (account, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[username]
+	return u, ok
+}
+
+func newAccount(username, role, password string, mustChange bool) (account, error) {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return account{}, err
+	}
+	return account{Username: username, Role: role, Salt: hex.EncodeToString(salt), Hash: hex.EncodeToString(passwordHash(password, salt)), MustChange: mustChange, CreatedAt: time.Now().UTC()}, nil
+}
+
+func passwordHash(password string, salt []byte) []byte {
+	mac := hmac.New(sha256.New, []byte(password))
+	mac.Write(append(append([]byte(nil), salt...), 0, 0, 0, 1))
+	u := mac.Sum(nil)
+	result := append([]byte(nil), u...)
+	for i := 1; i < passwordIterations; i++ {
+		mac = hmac.New(sha256.New, []byte(password))
+		mac.Write(u)
+		u = mac.Sum(nil)
+		for j := range result {
+			result[j] ^= u[j]
+		}
+	}
+	return result
+}
+
+func validUsername(username string) bool {
+	if len(username) < 3 || len(username) > 32 {
+		return false
+	}
+	for _, r := range username {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func randomPassword() (string, error) {
+	var b [18]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return "Frp!" + hex.EncodeToString(b[:]), nil
 }
 
 func newManager(dataDir, frpc string) *manager {
@@ -371,10 +633,10 @@ func parseMetrics(body io.Reader) (uint64, uint64) {
 }
 
 type webHandler struct {
-	manager            *manager
-	username, password string
-	sessions           map[string]time.Time
-	sessionMu          sync.Mutex
+	manager   *manager
+	users     *userStore
+	sessions  map[string]session
+	sessionMu sync.Mutex
 }
 
 func (h *webHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -387,19 +649,23 @@ func (h *webHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		name := filepath.Base(r.URL.Path)
-		if name != "app.css" && name != "app.js" {
+		if name != "app.css" && name != "app.js" && name != "account.js" {
 			http.NotFound(w, r)
 			return
 		}
 		http.ServeFile(w, r, filepath.Join("web", name))
 		return
 	}
-	if r.URL.Path == "/login.html" {
+	if r.URL.Path == "/login.html" || r.URL.Path == "/account.html" {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			methodNotAllowed(w)
 			return
 		}
-		http.ServeFile(w, r, "web/login.html")
+		page := "login.html"
+		if r.URL.Path == "/account.html" {
+			page = "account.html"
+		}
+		http.ServeFile(w, r, filepath.Join("web", page))
 		return
 	}
 	if r.URL.Path == "/api/login" && r.Method == http.MethodPost {
@@ -416,16 +682,25 @@ func (h *webHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if !h.authorized(r) {
+	user, authenticated := h.currentUser(r)
+	if !authenticated {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			writeError(w, http.StatusUnauthorized, "请先登录")
 		} else {
-			http.ServeFile(w, r, "web/login.html")
+			http.Redirect(w, r, "/login.html", http.StatusSeeOther)
+		}
+		return
+	}
+	if user.MustChange && r.URL.Path != "/account.html" && r.URL.Path != "/api/password" && r.URL.Path != "/api/me" && r.URL.Path != "/api/logout" {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			writeError(w, http.StatusForbidden, "首次登录请先修改临时密码")
+		} else {
+			http.Redirect(w, r, "/account.html", http.StatusSeeOther)
 		}
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/") {
-		h.api(w, r)
+		h.api(w, r, user)
 		return
 	}
 	if r.URL.Path == "/" {
@@ -444,7 +719,12 @@ func (h *webHandler) login(w http.ResponseWriter, r *http.Request) {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if decodeJSON(w, r, &credentials) != nil || subtle.ConstantTimeCompare([]byte(credentials.Username), []byte(h.username)) != 1 || subtle.ConstantTimeCompare([]byte(credentials.Password), []byte(h.password)) != 1 {
+	if decodeJSON(w, r, &credentials) != nil {
+		writeError(w, http.StatusUnauthorized, "用户名或密码错误")
+		return
+	}
+	user, ok := h.users.authenticate(credentials.Username, credentials.Password)
+	if !ok {
 		writeError(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
@@ -456,45 +736,139 @@ func (h *webHandler) login(w http.ResponseWriter, r *http.Request) {
 	value := hex.EncodeToString(token[:])
 	h.sessionMu.Lock()
 	now := time.Now()
-	for session, expiry := range h.sessions {
-		if now.After(expiry) {
-			delete(h.sessions, session)
+	for token, sess := range h.sessions {
+		if now.After(sess.Expires) {
+			delete(h.sessions, token)
 		}
 	}
-	h.sessions[value] = now.Add(24 * time.Hour)
+	h.sessions[value] = session{Username: user.Username, Expires: now.Add(24 * time.Hour)}
 	h.sessionMu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: "frp_session", Value: value, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil, MaxAge: 86400})
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (h *webHandler) authorized(r *http.Request) bool {
+func (h *webHandler) currentUser(r *http.Request) (account, bool) {
 	cookie, err := r.Cookie("frp_session")
 	if err != nil {
-		return false
+		return account{}, false
 	}
 	if len(cookie.Value) != 64 {
-		return false
+		return account{}, false
 	}
 	if _, err := hex.DecodeString(cookie.Value); err != nil {
-		return false
+		return account{}, false
 	}
 	h.sessionMu.Lock()
-	defer h.sessionMu.Unlock()
-	expiry, ok := h.sessions[cookie.Value]
-	if !ok || time.Now().After(expiry) {
+	sess, ok := h.sessions[cookie.Value]
+	if !ok || time.Now().After(sess.Expires) {
 		delete(h.sessions, cookie.Value)
-		return false
+		h.sessionMu.Unlock()
+		return account{}, false
 	}
-	return true
+	h.sessionMu.Unlock()
+	user, ok := h.users.get(sess.Username)
+	return user, ok
 }
 
-func (h *webHandler) api(w http.ResponseWriter, r *http.Request) {
+func (h *webHandler) api(w http.ResponseWriter, r *http.Request, user account) {
 	if r.URL.Path == "/api/me" {
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"username": h.username})
+		writeJSON(w, http.StatusOK, publicAccount{user.Username, user.Role, user.MustChange})
+		return
+	}
+	if r.URL.Path == "/api/password" {
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w)
+			return
+		}
+		var request struct {
+			Current string `json:"current"`
+			New     string `json:"new"`
+		}
+		if err := decodeJSON(w, r, &request); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+		if err := h.users.changePassword(user.Username, request.Current, request.New, user.MustChange); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+		h.sessionMu.Lock()
+		for token, sess := range h.sessions {
+			if sess.Username == user.Username {
+				delete(h.sessions, token)
+			}
+		}
+		h.sessionMu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.URL.Path == "/api/users" {
+		if user.Role != "admin" {
+			writeError(w, 403, "需要管理员权限")
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, 200, h.users.list())
+		case http.MethodPost:
+			var request struct {
+				Username string `json:"username"`
+				Role     string `json:"role"`
+			}
+			if err := decodeJSON(w, r, &request); err != nil {
+				writeError(w, 400, err.Error())
+				return
+			}
+			temp, err := randomPassword()
+			if err != nil {
+				writeError(w, 500, err.Error())
+				return
+			}
+			created, err := h.users.add(request.Username, request.Role, temp, true)
+			if err != nil {
+				writeError(w, 400, err.Error())
+				return
+			}
+			writeJSON(w, 201, map[string]any{"user": publicAccount{created.Username, created.Role, created.MustChange}, "temporaryPassword": temp})
+		default:
+			methodNotAllowed(w)
+		}
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/users/") {
+		if user.Role != "admin" {
+			writeError(w, 403, "需要管理员权限")
+			return
+		}
+		username := strings.TrimPrefix(r.URL.Path, "/api/users/")
+		if !validUsername(username) {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodDelete {
+			methodNotAllowed(w)
+			return
+		}
+		if username == user.Username {
+			writeError(w, 400, "不能删除当前登录账号")
+			return
+		}
+		if err := h.users.remove(username); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+		h.sessionMu.Lock()
+		for token, sess := range h.sessions {
+			if sess.Username == username {
+				delete(h.sessions, token)
+			}
+		}
+		h.sessionMu.Unlock()
+		w.WriteHeader(204)
 		return
 	}
 	if r.URL.Path == "/api/profiles" {
@@ -625,18 +999,79 @@ func validID(id string) bool {
 }
 
 func main() {
-	addr := os.Getenv("FRP_MANAGER_ADDR")
-	if addr == "" {
-		addr = "127.0.0.1:8080"
-	}
-	user := os.Getenv("FRP_MANAGER_USER")
-	password := os.Getenv("FRP_MANAGER_PASSWORD")
-	if user == "" || password == "" {
-		log.Fatal("必须设置 FRP_MANAGER_USER 和 FRP_MANAGER_PASSWORD")
-	}
 	dataDir := os.Getenv("FRP_MANAGER_DATA_DIR")
 	if dataDir == "" {
 		dataDir = "data"
+	}
+	users := newUserStore(dataDir)
+	if err := users.load(); err != nil {
+		log.Fatal(err)
+	}
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "admin-init":
+			username := "admin"
+			if len(os.Args) > 2 {
+				username = os.Args[2]
+			}
+			if _, exists := users.get(strings.ToLower(username)); exists {
+				log.Fatal("账号已存在")
+			}
+			password, err := randomPassword()
+			if err != nil {
+				log.Fatal(err)
+			}
+			if _, err := users.add(username, "admin", password, true); err != nil {
+				log.Fatal(err)
+			}
+			fmt.Printf("管理员账号: %s\n临时密码: %s\n请首次登录后立即修改密码。\n", strings.ToLower(username), password)
+			return
+		case "user-add":
+			if len(os.Args) < 4 {
+				log.Fatal("用法: frp-manager user-add <用户名> <user|admin>")
+			}
+			password, err := randomPassword()
+			if err != nil {
+				log.Fatal(err)
+			}
+			u, err := users.add(os.Args[2], os.Args[3], password, true)
+			if err != nil {
+				log.Fatal(err)
+			}
+			fmt.Printf("用户名: %s\n临时密码: %s\n", u.Username, password)
+			return
+		case "user-reset":
+			if len(os.Args) < 3 {
+				log.Fatal("用法: frp-manager user-reset <用户名>")
+			}
+			password, err := randomPassword()
+			if err != nil {
+				log.Fatal(err)
+			}
+			if err := users.resetPassword(strings.ToLower(os.Args[2]), password); err != nil {
+				log.Fatal(err)
+			}
+			fmt.Printf("用户名: %s\n临时密码: %s\n", strings.ToLower(os.Args[2]), password)
+			return
+		case "user-delete":
+			if len(os.Args) < 3 {
+				log.Fatal("用法: frp-manager user-delete <用户名>")
+			}
+			if err := users.remove(strings.ToLower(os.Args[2])); err != nil {
+				log.Fatal(err)
+			}
+			fmt.Println("账号已删除")
+			return
+		default:
+			log.Fatalf("未知命令: %s", os.Args[1])
+		}
+	}
+	if len(users.list()) == 0 {
+		log.Fatal("尚无管理账号。请先运行: frp-manager admin-init [用户名]")
+	}
+	addr := os.Getenv("FRP_MANAGER_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:8080"
 	}
 	frpc := os.Getenv("FRPC_BINARY")
 	if frpc == "" {
@@ -646,7 +1081,7 @@ func main() {
 	if err := m.load(); err != nil {
 		log.Fatal(err)
 	}
-	srv := &http.Server{Addr: addr, Handler: &webHandler{manager: m, username: user, password: password, sessions: map[string]time.Time{}}, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: addr, Handler: &webHandler{manager: m, users: users, sessions: map[string]session{}}, ReadHeaderTimeout: 5 * time.Second}
 	log.Printf("FRP manager listening on %s", addr)
 	log.Fatal(srv.ListenAndServe())
 }
