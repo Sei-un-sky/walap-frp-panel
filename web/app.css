@@ -14,3 +14,6 @@
 @media(max-width:560px){.user-create{grid-template-columns:1fr 110px}.user-create button{grid-column:1/-1}.top-actions{gap:5px}.live-indicator{font-size:11px}}
 .tunnel-active{color:var(--green);font-weight:600}.tunnel-inactive{color:var(--red)}
 .config-hint{margin:-5px 0 15px;line-height:1.5}
+.dashboard-fields{border:1px solid var(--line);border-radius:4px;padding:12px;margin:0 0 14px}.dashboard-fields legend{padding:0 6px;font-size:12px;font-weight:600;color:var(--muted)}.dashboard-fields .field-label{margin:0 0 10px}.dashboard-auth{display:grid;grid-template-columns:1fr 1fr;gap:10px}.autostart-setting,.autostart-card{display:flex;align-items:center;gap:8px;font-size:13px}.autostart-setting{margin:10px 0 16px}.autostart-setting input,.autostart-card input{accent-color:var(--green);width:16px;height:16px}.autostart-card{white-space:nowrap;color:var(--muted)}.tunnel-row{grid-template-columns:minmax(100px,1fr) 70px minmax(140px,1.4fr)}
+@media(max-width:560px){.dashboard-auth{grid-template-columns:1fr}.tunnel-row{grid-template-columns:minmax(85px,1fr) 48px minmax(120px,1.4fr)}}
+.traffic-error{grid-column:1/-1;color:var(--amber);font-size:11px;white-space:normal}.autofill-decoys{position:absolute;left:-10000px;width:1px;height:1px;overflow:hidden}

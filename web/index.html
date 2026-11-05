@@ -26,11 +26,13 @@
   </main>
 
   <dialog id="editor" class="editor-dialog">
-    <form id="profile-form" method="dialog">
+    <form id="profile-form" method="dialog" autocomplete="off">
       <div class="dialog-heading"><div><p class="eyebrow">CLIENT PROFILE</p><h2 id="dialog-title">添加实例</h2></div><button type="button" class="icon-button" id="close" aria-label="关闭">×</button></div>
       <label class="field-label">实例名称<input id="name" maxlength="80" placeholder="例如：东京边缘节点" required></label>
       <label class="field-label">TOML 配置<textarea id="config" spellcheck="false" required placeholder='serverAddr = "frps.example.com"&#10;serverPort = 7000&#10;&#10;[webServer]&#10;addr = "127.0.0.1"&#10;port = 7400&#10;user = "frpc-admin"&#10;password = "替换为独立强密码"&#10;&#10;[[proxies]]&#10;name = "web"&#10;type = "http"&#10;localPort = 8080&#10;customDomains = ["example.com"]'></textarea></label>
-      <p class="muted config-hint">隧道状态需要 [webServer] 管理接口，保存后重启该 frpc 实例生效。代理流量统计需要另行配置 frps Dashboard。</p>
+      <div class="autofill-decoys" aria-hidden="true"><input type="text" name="username" autocomplete="username" tabindex="-1"><input type="password" name="password" autocomplete="current-password" tabindex="-1"></div>
+      <fieldset class="dashboard-fields"><legend>frps Dashboard 流量查询</legend><label class="field-label">Dashboard 根地址<input id="dashboard-addr" type="text" name="no-autofill-dashboard-endpoint" autocomplete="off" readonly data-lpignore="true" data-1p-ignore="true" spellcheck="false" placeholder="http://frps.example.com:7500"></label><div class="dashboard-auth"><label class="field-label">Dashboard 用户名<input id="dashboard-user" name="no-autofill-dashboard-account" type="text" autocomplete="off" readonly data-lpignore="true" data-1p-ignore="true"></label><label class="field-label">Dashboard 密码<input id="dashboard-pass" name="no-autofill-dashboard-secret" type="password" autocomplete="new-password" data-lpignore="true" data-1p-ignore="true"></label></div><p class="muted config-hint">填写 frps 的 dashboard/webServer 地址，不是 frpc 管理页面地址。面板会在此地址后请求 /api/traffic；反向代理需保留 /api 路径。</p></fieldset>
+      <label class="autostart-setting"><input id="autostart" type="checkbox"><span>面板启动时自动启动此 frpc 实例</span></label>
       <p id="editor-error" class="form-error"></p>
       <div class="dialog-footer"><span class="muted">保存前将检查 TOML 格式</span><button class="primary-button" type="submit">保存配置</button></div>
     </form>

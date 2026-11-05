@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,10 +31,14 @@ const passwordIterations = 310000
 const minPasswordLength = 8
 
 type Profile struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Config    string    `json:"config"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	Config        string    `json:"config"`
+	DashboardAddr string    `json:"dashboardAddr,omitempty"`
+	DashboardUser string    `json:"dashboardUser,omitempty"`
+	DashboardPass string    `json:"dashboardPass,omitempty"`
+	Autostart     bool      `json:"autostart"`
+	UpdatedAt     time.Time `json:"updatedAt"`
 }
 
 type Runtime struct {
@@ -41,6 +46,7 @@ type Runtime struct {
 	AdminEnabled bool     `json:"adminEnabled"`
 	Connected    bool     `json:"connected"`
 	TrafficKnown bool     `json:"trafficKnown"`
+	TrafficError string   `json:"trafficError,omitempty"`
 	PID          int      `json:"pid,omitempty"`
 	Error        string   `json:"error,omitempty"`
 	Tunnels      []Tunnel `json:"tunnels"`
@@ -49,10 +55,13 @@ type Runtime struct {
 }
 
 type Tunnel struct {
-	Name   string `json:"name"`
-	Type   string `json:"type"`
-	Status string `json:"status"`
-	Error  string `json:"err,omitempty"`
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Status     string `json:"status"`
+	Error      string `json:"err,omitempty"`
+	InBytes    uint64 `json:"inBytes,omitempty"`
+	OutBytes   uint64 `json:"outBytes,omitempty"`
+	TrafficSet bool   `json:"trafficSet,omitempty"`
 }
 
 type profileView struct {
@@ -353,6 +362,42 @@ func (m *manager) load() error {
 	return nil
 }
 
+func (m *manager) startAutostart() {
+	m.mu.Lock()
+	ids := make([]string, 0)
+	for id, p := range m.profiles {
+		if p.Autostart {
+			ids = append(ids, id)
+		}
+	}
+	m.mu.Unlock()
+	sort.Strings(ids)
+	for _, id := range ids {
+		if err := m.start(id); err != nil {
+			log.Printf("autostart frpc %s failed: %v", id, err)
+		}
+	}
+}
+
+func (m *manager) setAutostart(id string, enabled bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.profiles[id]
+	if !ok {
+		return os.ErrNotExist
+	}
+	old := p.Autostart
+	p.Autostart = enabled
+	p.UpdatedAt = time.Now().UTC()
+	m.profiles[id] = p
+	if err := m.persistLocked(); err != nil {
+		p.Autostart = old
+		m.profiles[id] = p
+		return err
+	}
+	return nil
+}
+
 func (m *manager) persistLocked() error {
 	list := make([]Profile, 0, len(m.profiles))
 	for _, p := range m.profiles {
@@ -538,14 +583,94 @@ func (m *manager) snapshot() []profileView {
 		admin := readAdmin(p.Config)
 		if admin != nil {
 			rt.AdminEnabled = true
+		}
+		if rt.Running && admin != nil {
 			client := http.Client{Timeout: time.Second}
 			base := "http://" + net.JoinHostPort(admin.addr, strconv.Itoa(admin.port))
 			rt.Tunnels, rt.Connected, rt.Error = readFRPCStatus(&client, base, admin)
+		}
+		if rt.Running && rt.Connected && p.DashboardAddr != "" {
+			client := http.Client{Timeout: 2 * time.Second}
+			rt.TrafficError = readProxyTraffic(&client, p.DashboardAddr, p.DashboardUser, p.DashboardPass, rt.Tunnels)
+			for _, tunnel := range rt.Tunnels {
+				if tunnel.TrafficSet {
+					rt.InBytes += tunnel.InBytes
+					rt.OutBytes += tunnel.OutBytes
+				}
+			}
+			if rt.Connected && (len(rt.Tunnels) == 0 || allTunnelTrafficKnown(rt.Tunnels)) {
+				rt.TrafficKnown = true
+			}
 		}
 		result = append(result, profileView{p, rt})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].UpdatedAt.After(result[j].UpdatedAt) })
 	return result
+}
+
+func readProxyTraffic(client *http.Client, dashboardAddr, username, password string, tunnels []Tunnel) string {
+	base := strings.TrimRight(dashboardAddr, "/")
+	if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+		base = "http://" + base
+	}
+	if _, err := url.ParseRequestURI(base); err != nil {
+		return "Dashboard 地址格式无效"
+	}
+	var firstError string
+	for i := range tunnels {
+		req, err := http.NewRequest(http.MethodGet, base+"/api/traffic/"+url.PathEscape(tunnels[i].Name), nil)
+		if err != nil {
+			if firstError == "" { firstError = "Dashboard 地址格式无效" }
+			continue
+		}
+		if username != "" || password != "" {
+			req.SetBasicAuth(username, password)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			if firstError == "" { firstError = "无法连接 frps Dashboard" }
+			continue
+		}
+		var traffic struct {
+			TrafficIn  []int64 `json:"trafficIn"`
+			TrafficOut []int64 `json:"trafficOut"`
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 && json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&traffic) == nil {
+			tunnels[i].InBytes = sumTraffic(traffic.TrafficIn)
+			tunnels[i].OutBytes = sumTraffic(traffic.TrafficOut)
+			tunnels[i].TrafficSet = true
+		} else if firstError == "" {
+			switch resp.StatusCode {
+			case http.StatusUnauthorized, http.StatusForbidden:
+				firstError = "frps Dashboard 认证失败"
+			case http.StatusNotFound:
+				firstError = "Dashboard API 返回 HTTP 404：请确认这里填写的是 frps Dashboard 根地址（不是 frpc 管理页），且反向代理保留 /api 路径"
+			default:
+				firstError = fmt.Sprintf("frps Dashboard 返回 HTTP %d", resp.StatusCode)
+			}
+		}
+		resp.Body.Close()
+	}
+	return firstError
+}
+
+func sumTraffic(samples []int64) uint64 {
+	var total uint64
+	for _, sample := range samples {
+		if sample > 0 {
+			total += uint64(sample)
+		}
+	}
+	return total
+}
+
+func allTunnelTrafficKnown(tunnels []Tunnel) bool {
+	for _, tunnel := range tunnels {
+		if !tunnel.TrafficSet {
+			return false
+		}
+	}
+	return true
 }
 
 func readFRPCStatus(client *http.Client, base string, admin *adminConfig) ([]Tunnel, bool, string) {
@@ -933,6 +1058,25 @@ func (h *webHandler) api(w http.ResponseWriter, r *http.Request, user account) {
 		}
 		return
 	}
+	if len(parts) == 2 && parts[1] == "autostart" {
+		if r.Method != http.MethodPut {
+			methodNotAllowed(w)
+			return
+		}
+		var request struct {
+			Enabled bool `json:"enabled"`
+		}
+		if err := decodeJSON(w, r, &request); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+		if err := h.manager.setAutostart(id, request.Enabled); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if len(parts) != 2 || r.Method != http.MethodPost {
 		methodNotAllowed(w)
 		return
@@ -1081,6 +1225,7 @@ func main() {
 	if err := m.load(); err != nil {
 		log.Fatal(err)
 	}
+	m.startAutostart()
 	srv := &http.Server{Addr: addr, Handler: &webHandler{manager: m, users: users, sessions: map[string]session{}}, ReadHeaderTimeout: 5 * time.Second}
 	log.Printf("FRP manager listening on %s", addr)
 	log.Fatal(srv.ListenAndServe())

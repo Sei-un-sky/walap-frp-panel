@@ -9,6 +9,7 @@
 - 密码以 PBKDF2-HMAC-SHA256 派生值和随机盐保存，不存明文。
 - 网页编辑 TOML、语法检查、实例启停；修改已有配置前自动备份旧版本。
 - 默认跟随设备明暗主题实时切换；工具栏主题按钮可在跟随系统、夜间、明亮三种模式间切换，手动选择保存在当前浏览器本地。
+- 可配置 `frps` Dashboard 查询每条代理的累计收发流量，并为每个 `frpc` 实例设置面板启动时自动运行。
 - 显示 `frpc` 进程状态、管理接口状态、隧道状态及接口提供的流量累计值。
 
 ## 环境要求与构建
@@ -22,6 +23,23 @@ go test ./...
 go vet ./...
 go build -o frp-manager .
 ```
+
+## Release 包
+
+预构建发行包位于 `release/`，包名包含目标系统和架构，例如 `frp-manager-linux-amd64.zip`。解压后包含 `frp-manager` 面板程序、`web/` 静态资源、systemd unit、环境配置模板和本说明文件。Release 不包含 Go 源码、测试文件、运行数据或 `frpc`；请单独下载与目标系统及架构匹配的 FRP 客户端，并在环境配置中设置其路径。
+
+Linux x86_64 示例：
+
+```sh
+unzip frp-manager-linux-amd64.zip
+cd frp-manager-linux-amd64
+sudo install -d -o frp-manager -g frp-manager -m 0750 /opt/frp-manager
+sudo install -o root -g root -m 0755 frp-manager /opt/frp-manager/frp-manager
+sudo cp -r web /opt/frp-manager/
+sudo install -o root -g root -m 0644 frp-manager.service /etc/systemd/system/frp-manager.service
+```
+
+如服务账户尚未创建，请按下方 systemd 部署说明创建账户。随后将 `frpc` 安装到 `/opt/frp-manager/frpc`，复制并编辑 `/etc/default/frp-manager`，初始化管理员账号，然后启用服务。Release 包适用于 `linux/amd64`；其他系统或架构需从源码交叉编译，或生成对应平台的发行包。
 
 ## 账号初始化与管理
 
@@ -161,12 +179,21 @@ remotePort = 6000
 
 管理接口凭据保存在 TOML 配置中，配置编辑器会回显完整内容。应限制面板账号权限，并为各接口使用独立凭据。面板通过 `frpc` 的 `/api/status` 读取代理列表及 `running`、`start error` 等运行状态。需要在每份客户端 TOML 中配置 `[webServer]` 并重启对应 `frpc`，否则只能看到进程状态，不能确认服务端隧道是否建立。
 
-FRP 0.71.1 的 `frpc` `/metrics` 只提供 Go 运行时指标，不包含代理流量，因此面板不会把缺失数据伪装成 `0 B`，而会显示“未提供”。代理流量统计由 `frps` 服务端 Dashboard API 提供；如需在面板展示每条代理的实时累计流量，需要额外配置对应 `frps` dashboard 地址和账号，再按代理名称查询 `/api/traffic/{name}`。当前版本尚未接入该服务端 API。
+FRP 0.71.1 的 `frpc` `/metrics` 只提供 Go 运行时指标，不包含代理流量。面板在实例编辑中配置 `frps` Dashboard 根地址和 Basic Auth 后，通过 `/api/traffic/{代理名}` 读取累计收发字节，并显示到每条隧道。Dashboard 地址必须从面板主机可达，格式为 `http://frps.example.com:7500`；不要填 `frpc` 的 `webServer` 管理页面地址，也不要在地址中附加 `/dashboard/` 等页面路径。若使用反向代理，须将 `/api/traffic/...` 原样转发到 frps。面板会区分连接失败、认证失败和 HTTP 404；404 通常表示地址/路径不对应 frps Dashboard API，或该 Dashboard 没有该代理的流量记录。Dashboard 密码保存在 `$FRP_MANAGER_DATA_DIR/profiles.json`，该文件仅服务账户可读写；请勿将面板或 Dashboard 暴露给不可信网络。
 
 `running` 表示 frpc 当前成功启动了对应代理。若显示 `start error`，请检查相应 `err` 信息、frps 端口和本地服务监听；“进程运行中”只代表 frpc 进程还活着，不代表某条隧道可用。配置管理接口后需重启该实例使设置生效。
 
-## 测试环境记录
+### 面板和 frpc 开机自启动
 
-测试机 `192.168.10.22` 的面板目录为 `/home/seiun/frp-manager`，测试 FRP 版本为 0.71.1。已运行 `go test ./...`、`go vet ./...`，并验证 FRP 示例 TOML。多用户登录、首次强制改密、普通用户实例权限、管理员用户管理权限均通过 HTTP 验证；测试用户已清理，管理员当前设置为 CLI 生成的首次登录临时密码。
+systemd 面板服务启用开机启动后，面板会读取各实例保存的“开机启动”选项，并自动运行勾选的 `frpc`。每个实例在网页配置对话框中单独勾选，或使用实例卡片上的“开机启动”复选框。该设置保存在 `profiles.json`，不修改系统服务文件。部署 systemd 后启用面板服务：
 
-测试机面板当前由测试会话手动运行于 `:8080`，没有安装为 systemd 服务。示例 FRP 配置指向 `127.0.0.1:7000`，因无对应运行中的 `frps`，未启动真实隧道。请使用 CLI 输出的管理员临时密码登录，并立即设置新密码；密码不记录在本文件中。
+```sh
+sudo systemctl enable --now frp-manager
+sudo systemctl is-enabled frp-manager
+```
+
+若面板不是 systemd 服务，或系统中没有启用该服务，实例开机自动启动不会生效。面板启动日志会记录单个实例的自动启动失败原因，可用 `journalctl -u frp-manager` 查看。
+
+## Release 构建
+
+Release 中不包含运行时数据、账号数据库、用户 TOML 配置、备份、日志、测试源码或 `frpc` 客户端。请在部署前检查环境配置、systemd 运行用户和 `frpc` 路径，并按账号初始化说明创建管理员。不要把包含真实凭据或配置的运行数据目录加入发行包。

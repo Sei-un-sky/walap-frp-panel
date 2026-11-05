@@ -1,3 +1,7 @@
 /data/
 /frp-manager
 /frp-manager.exe
+/release/
+*.log
+*.tmp
+*.upload

@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -45,6 +46,74 @@ func TestReadFRPCStatusGroupedByType(t *testing.T) {
 	}
 	if len(tunnels) != 2 || tunnels[0].Name != "site" || tunnels[0].Status != "start error" || tunnels[1].Name != "ssh" || tunnels[1].Status != "running" {
 		t.Fatalf("unexpected tunnels: %#v", tunnels)
+	}
+}
+
+func TestReadProxyTraffic(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/traffic/ssh" {
+			t.Errorf("request path = %q", r.URL.Path)
+		}
+		username, password, ok := r.BasicAuth()
+		if !ok || username != "dash" || password != "secret" {
+			t.Errorf("dashboard basic auth not sent")
+		}
+		_, _ = w.Write([]byte(`{"name":"ssh","trafficIn":[1000,234],"trafficOut":[5000,678]}`))
+	}))
+	defer server.Close()
+	tunnels := []Tunnel{{Name: "ssh", Type: "tcp"}}
+	readProxyTraffic(server.Client(), server.URL, "dash", "secret", tunnels)
+	if !tunnels[0].TrafficSet || tunnels[0].InBytes != 1234 || tunnels[0].OutBytes != 5678 {
+		t.Fatalf("unexpected tunnel traffic: %#v", tunnels[0])
+	}
+}
+
+func TestReadProxyTrafficReportsAuthenticationAndMissingProxy(t *testing.T) {
+	for _, test := range []struct {
+		status int
+		want   string
+	}{{http.StatusUnauthorized, "frps Dashboard 认证失败"}, {http.StatusNotFound, "Dashboard API 返回 HTTP 404：请确认这里填写的是 frps Dashboard 根地址（不是 frpc 管理页），且反向代理保留 /api 路径"}} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(test.status) }))
+		tunnels := []Tunnel{{Name: "ssh"}}
+		got := readProxyTraffic(server.Client(), server.URL, "", "", tunnels)
+		server.Close()
+		if got != test.want {
+			t.Errorf("status %d error=%q, want %q", test.status, got, test.want)
+		}
+	}
+}
+
+func TestAutostartPersistsAndStartsSelectedProfiles(t *testing.T) {
+	dir := t.TempDir()
+	m := newManager(dir, "frpc")
+	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	frpc := filepath.Join(dir, "bin", "frpc")
+	if err := os.WriteFile(frpc, []byte("#!/bin/sh\nsleep 30\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	m.frpc = frpc
+	p, err := m.save(Profile{Name: "auto", Config: "serverAddr = \"127.0.0.1\"\nserverPort = 7000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.setAutostart(p.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := newManager(dir, frpc)
+	if err := reloaded.load(); err != nil {
+		t.Fatal(err)
+	}
+	if !reloaded.profiles[p.ID].Autostart {
+		t.Fatal("autostart flag was not persisted")
+	}
+	reloaded.startAutostart()
+	if reloaded.process[p.ID] == nil {
+		t.Fatal("autostart profile did not start")
+	}
+	if err := reloaded.stop(p.ID); err != nil {
+		t.Fatal(err)
 	}
 }
 
